@@ -1,0 +1,2402 @@
+---
+title: "Master Thesis — Immune Deconvolution Benchmark"
+author: "Diego Vázquez Zambrano"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+---
+
+
+```{r}
+# scripts/00_setup_paths.R
+suppressPackageStartupMessages({
+  if (requireNamespace("here", quietly = TRUE)) library(here)
+})
+
+detect_project_root <- function() {
+  env_root <- Sys.getenv("PROJECT_ROOT", unset = "")
+  if (nzchar(env_root) && dir.exists(env_root)) {
+    return(normalizePath(env_root, winslash = "/", mustWork = TRUE))
+  }
+
+  if (exists("here") && is.function(here::here)) {
+    root <- tryCatch(here::here(), error = function(e) NA_character_)
+    if (!is.na(root) && dir.exists(root)) {
+      return(normalizePath(root, winslash = "/", mustWork = TRUE))
+    }
+  }
+
+  normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+
+PROJECT_ROOT <- detect_project_root()
+path_root <- function(...) file.path(PROJECT_ROOT, ...)
+
+DIR_DATA    <- path_root("data")
+DIR_SCRIPTS <- path_root("scripts")
+DIR_RESULTS <- path_root("results")
+DIR_FIGURES <- path_root("figures")
+DIR_LOGS    <- path_root("logs")
+
+required_dirs <- c(DIR_DATA, DIR_SCRIPTS)
+missing_required <- required_dirs[!vapply(required_dirs, dir.exists, logical(1))]
+
+if (length(missing_required) > 0) {
+  stop(
+    "Missing required folders:\n- ",
+    paste(missing_required, collapse = "\n- "),
+    "\nPROJECT_ROOT = ", PROJECT_ROOT
+  )
+}
+
+dir.create(DIR_RESULTS, showWarnings = FALSE, recursive = TRUE)
+dir.create(DIR_FIGURES, showWarnings = FALSE, recursive = TRUE)
+dir.create(DIR_LOGS, showWarnings = FALSE, recursive = TRUE)
+
+log_msg <- function(...) {
+  msg <- paste0(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " | ", paste(..., collapse = " "))
+  cat(msg, "\n")
+  write(msg, file = file.path(DIR_LOGS, "pipeline.log"), append = TRUE)
+}
+
+set.seed(1)
+log_msg("OK: paths initialized | PROJECT_ROOT =", PROJECT_ROOT)
+```
+
+
+```{r}
+# scripts/01_bulk_load_prepare.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+in_expr <- file.path(DIR_DATA, "bulk", "GSE297742_YUHS_TPM_EXPR_Biopsy_processed.csv.gz")
+in_meta <- file.path(DIR_DATA, "bulk", "GSE297742_YUHS_TPM_EXPR_Biopsy_clinical_metadata.csv.gz")
+
+stopifnot(file.exists(in_expr))
+stopifnot(file.exists(in_meta))
+
+log_msg("Reading bulk expression:", in_expr)
+expr <- data.table::fread(in_expr)
+
+log_msg("Reading bulk metadata:", in_meta)
+meta <- data.table::fread(in_meta)
+
+# Expectation: first column is gene, remaining columns are samples
+gene_col <- names(expr)[1]
+genes <- expr[[gene_col]]
+
+# Collapse duplicated gene names by mean TPM (required: unique rownames)
+if (anyDuplicated(genes)) {
+  log_msg("Duplicated gene names detected. Collapsing by mean TPM.")
+  expr <- expr[, lapply(.SD, mean), by = gene_col, .SDcols = setdiff(names(expr), gene_col)]
+}
+genes <- expr[[gene_col]]
+stopifnot(!anyDuplicated(genes))
+
+sample_cols <- setdiff(names(expr), gene_col)
+stopifnot(length(sample_cols) > 0)
+
+# Build matrix: genes x samples
+bulk_mat <- as.matrix(expr[, ..sample_cols])
+rownames(bulk_mat) <- genes
+
+# Basic sanity checks
+stopifnot(is.numeric(bulk_mat))
+stopifnot(all(is.finite(bulk_mat)))
+stopifnot(all(bulk_mat >= 0))
+
+# Ensure sample IDs are unique
+stopifnot(!anyDuplicated(colnames(bulk_mat)))
+
+# Standardize metadata key: try common sample id columns
+meta_cols <- names(meta)
+candidate_keys <- c("sample", "sample_id", "Sample", "SampleID", "geo_accession", "GEO_Accession")
+key <- candidate_keys[candidate_keys %in% meta_cols][1]
+
+if (is.na(key) || !nzchar(key)) {
+  stop("No sample ID column found in metadata. Columns are: ", paste(meta_cols, collapse = ", "))
+}
+
+meta_key <- meta[[key]]
+if (anyDuplicated(meta_key)) {
+  stop("Metadata sample key column has duplicates: ", key)
+}
+
+# Keep only samples present in both
+common_samples <- intersect(colnames(bulk_mat), meta_key)
+if (length(common_samples) == 0) {
+  stop("No overlapping sample IDs between expression matrix and metadata using key: ", key)
+}
+
+bulk_mat <- bulk_mat[, common_samples, drop = FALSE]
+meta <- meta[match(common_samples, meta_key)]
+
+# Save outputs
+out_dir <- file.path(DIR_RESULTS, "bulk")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+out_rds <- file.path(out_dir, "bulk_tpm_matrix.rds")
+out_meta <- file.path(out_dir, "bulk_metadata_clean.csv")
+
+saveRDS(bulk_mat, out_rds)
+data.table::fwrite(meta, out_meta)
+
+log_msg("Saved:", out_rds)
+log_msg("Saved:", out_meta)
+log_msg("Bulk matrix dims (genes x samples):", nrow(bulk_mat), "x", ncol(bulk_mat))
+```
+
+
+```{r}
+# scripts/02_bulk_define_labels.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+meta_path <- file.path(DIR_RESULTS, "bulk", "bulk_metadata_clean.csv")
+stopifnot(file.exists(meta_path))
+
+meta <- data.table::fread(meta_path)
+
+# Find a metastasis column (robust search by column name)
+nm <- names(meta)
+hits <- nm[grepl("met", nm, ignore.case = TRUE) |
+             grepl("\\bm\\b", nm, ignore.case = TRUE) |
+             grepl("stage", nm, ignore.case = TRUE) |
+             grepl("tnm", nm, ignore.case = TRUE)]
+
+if (length(hits) == 0) {
+  stop("No obvious metastasis-related column found in metadata. Columns are: ",
+       paste(nm, collapse = ", "))
+}
+
+log_msg("Candidate label columns:", paste(hits, collapse = ", "))
+
+# Print unique values for the top candidates
+top <- head(hits, 6)
+for (col in top) {
+  u <- unique(meta[[col]])
+  u <- u[!is.na(u)]
+  u <- u[seq_len(min(length(u), 20))]
+  log_msg("Column:", col, "| example values:", paste(u, collapse = " ; "))
+}
+
+out_dir <- file.path(DIR_RESULTS, "bulk")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Save the candidates list for traceability
+cand_path <- file.path(out_dir, "bulk_label_candidates.txt")
+writeLines(c(hits), cand_path)
+log_msg("Saved:", cand_path)
+
+```
+
+
+
+```{r}
+
+# scripts/03_bulk_make_m_labels.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+meta_path <- file.path(DIR_RESULTS, "bulk", "bulk_metadata_clean.csv")
+mat_path  <- file.path(DIR_RESULTS, "bulk", "bulk_tpm_matrix.rds")
+
+stopifnot(file.exists(meta_path))
+stopifnot(file.exists(mat_path))
+
+meta <- data.table::fread(meta_path)
+bulk_mat <- readRDS(mat_path)
+
+stopifnot("Clinical_stage_M" %in% names(meta))
+
+y_raw <- meta[["Clinical_stage_M"]]
+y_raw <- trimws(as.character(y_raw))
+
+keep <- y_raw %in% c("M0", "M1")
+if (!all(keep)) {
+  log_msg("Dropping samples with missing/other Clinical_stage_M values:",
+          sum(!keep), "out of", length(y_raw))
+}
+
+bulk_mat <- bulk_mat[, keep, drop = FALSE]
+meta <- meta[keep]
+y <- factor(y_raw[keep], levels = c("M0", "M1"))
+
+stopifnot(ncol(bulk_mat) == length(y))
+stopifnot(nrow(meta) == length(y))
+
+# Summary
+tab <- table(y)
+log_msg("Label counts:", paste(names(tab), as.integer(tab), sep = "=", collapse = " | "))
+
+# Save
+out_dir <- file.path(DIR_RESULTS, "bulk")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(bulk_mat, file.path(out_dir, "bulk_tpm_matrix_M0M1.rds"))
+data.table::fwrite(meta, file.path(out_dir, "bulk_metadata_M0M1.csv"))
+saveRDS(y, file.path(out_dir, "bulk_labels_M0M1.rds"))
+
+log_msg("Saved: bulk_tpm_matrix_M0M1.rds")
+log_msg("Saved: bulk_metadata_M0M1.csv")
+log_msg("Saved: bulk_labels_M0M1.rds")
+log_msg("Final bulk dims (genes x samples):", nrow(bulk_mat), "x", ncol(bulk_mat))
+```
+
+
+
+
+
+
+```{r}
+# scripts/04_scrna_load_prepare.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+in_expr  <- file.path(DIR_DATA, "scrna", "GSE297652_expression_matrix_data.csv.gz")
+in_cells <- file.path(DIR_DATA, "scrna", "GSE297652_cell_metadata.csv.gz")
+in_genes <- file.path(DIR_DATA, "scrna", "GSE297652_gene_annotation.csv.gz")
+
+stopifnot(file.exists(in_expr))
+stopifnot(file.exists(in_cells))
+stopifnot(file.exists(in_genes))
+
+log_msg("Reading scRNA expression:", in_expr)
+expr <- data.table::fread(in_expr)
+
+log_msg("Reading scRNA cell metadata:", in_cells)
+cell_meta <- data.table::fread(in_cells)
+
+log_msg("Reading scRNA gene annotation:", in_genes)
+gene_anno <- data.table::fread(in_genes)
+
+log_msg("Expression table dims:", nrow(expr), "x", ncol(expr))
+log_msg("Cell metadata rows:", nrow(cell_meta))
+log_msg("Gene annotation rows:", nrow(gene_anno))
+
+# Save quick summaries for the next step
+out_dir <- file.path(DIR_RESULTS, "scrna")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+writeLines(names(cell_meta), file.path(out_dir, "cell_metadata_columns.txt"))
+writeLines(names(gene_anno), file.path(out_dir, "gene_annotation_columns.txt"))
+
+log_msg("Saved: cell_metadata_columns.txt")
+log_msg("Saved: gene_annotation_columns.txt")
+
+# Identify likely sample identifier columns in cell metadata
+nm <- names(cell_meta)
+cand <- nm[grepl("sample|orig|patient|tissue|gsm|donor|biospec", nm, ignore.case = TRUE)]
+log_msg("Candidate sample-id columns:", if (length(cand) == 0) "NONE" else paste(cand, collapse = ", "))
+
+# Print example values for first few candidates
+top <- head(cand, 6)
+for (col in top) {
+  u <- unique(cell_meta[[col]])
+  u <- u[!is.na(u)]
+  u <- u[seq_len(min(length(u), 15))]
+  log_msg("Column:", col, "| example values:", paste(u, collapse = " ; "))
+}
+```
+
+
+```{r}
+
+# scripts/05_scrna_make_seurat.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+})
+
+DIR_10X <- file.path(DIR_DATA, "scrna", "10x")
+stopifnot(dir.exists(DIR_10X))
+
+sample_dirs <- list.dirs(DIR_10X, full.names = TRUE, recursive = FALSE)
+stopifnot(length(sample_dirs) > 0)
+
+sample_dirs <- sample_dirs[grepl("^mPCa_M[1-5]_filtered_feature_bc_matrix$", basename(sample_dirs))]
+stopifnot(length(sample_dirs) > 0)
+
+sample_dirs <- sample_dirs[order(sample_dirs)]
+
+objs <- list()
+
+for (d in sample_dirs) {
+  sample_id <- sub("_filtered_feature_bc_matrix$", "", basename(d))  # mPCa_M1 etc.
+
+  log_msg("Reading 10x:", d)
+  counts <- Read10X(data.dir = d)
+
+  seu <- CreateSeuratObject(counts = counts, project = "GSE297652_10x")
+  seu$Sample <- sample_id
+
+  mt_genes <- grep("^MT-", rownames(seu), value = TRUE)
+  if (length(mt_genes) > 0) {
+    seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^MT-")
+    log_msg("Computed percent.mt for", sample_id)
+  } else {
+    log_msg("No MT- genes found for", sample_id)
+  }
+
+  objs[[sample_id]] <- seu
+  log_msg("Loaded", sample_id, "| cells:", ncol(seu), "| genes:", nrow(seu))
+}
+
+log_msg("Merging samples")
+seu_merged <- Reduce(function(x, y) merge(x, y), objs)
+
+out_dir <- file.path(DIR_RESULTS, "scrna")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+out_rds <- file.path(out_dir, "scrna_seurat_raw.rds")
+saveRDS(seu_merged, out_rds)
+
+tab <- table(seu_merged$Sample)
+log_msg("Cells per Sample:", paste(names(tab), as.integer(tab), sep = "=", collapse = " | "))
+log_msg("Merged dims (genes x cells):", nrow(seu_merged), "x", ncol(seu_merged))
+log_msg("Saved:", out_rds)
+
+# QC filtering
+log_msg("QC filtering")
+
+# keep only cells with at least 200 detected genes
+seu_qc <- subset(seu_merged, subset = nFeature_RNA >= 200)
+
+# remove extreme high-feature cells (likely doublets); threshold by 99th percentile
+nf <- seu_qc$nFeature_RNA
+upper_nf <- as.numeric(stats::quantile(nf, probs = 0.99, na.rm = TRUE))
+seu_qc <- subset(seu_qc, subset = nFeature_RNA <= upper_nf)
+
+# remove high mitochondrial cells; fixed threshold
+seu_qc <- subset(seu_qc, subset = percent.mt <= 20)
+
+log_msg("QC thresholds:",
+        "min_nFeature=200",
+        "| max_nFeature(p99)=", round(upper_nf),
+        "| max_percent_mt=20")
+
+tab_qc <- table(seu_qc$Sample)
+log_msg("Cells per Sample after QC:", paste(names(tab_qc), as.integer(tab_qc), sep="=", collapse=" | "))
+log_msg("QC dims (genes x cells):", nrow(seu_qc), "x", ncol(seu_qc))
+
+out_qc <- file.path(out_dir, "scrna_seurat_qc.rds")
+saveRDS(seu_qc, out_qc)
+log_msg("Saved:", out_qc)
+```
+
+
+```{r}
+# scripts/06_scrna_process_cluster_markers.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Seurat)
+})
+
+in_qc <- file.path(DIR_RESULTS, "scrna", "scrna_seurat_qc.rds")
+stopifnot(file.exists(in_qc))
+
+seu <- readRDS(in_qc)
+
+log_msg("Processing scRNA QC object")
+log_msg("Input dims (genes x cells):", nrow(seu), "x", ncol(seu))
+
+seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 10000, verbose = FALSE)
+seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+seu <- ScaleData(seu, features = rownames(seu), verbose = FALSE)
+seu <- RunPCA(seu, npcs = 30, verbose = FALSE)
+
+seu <- FindNeighbors(seu, dims = 1:30, verbose = FALSE)
+seu <- FindClusters(seu, resolution = 0.3, verbose = FALSE)
+
+out_dir <- file.path(DIR_RESULTS, "scrna")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+out_proc <- file.path(out_dir, "scrna_seurat_proc.rds")
+saveRDS(seu, out_proc)
+log_msg("Saved:", out_proc)
+
+cl_tab <- table(Idents(seu))
+log_msg("Clusters:", paste(names(cl_tab), as.integer(cl_tab), sep = "=", collapse = " | "))
+
+seu <- JoinLayers(seu)
+log_msg("Joined assay layers")
+
+log_msg("Computing cluster markers (positive only)")
+markers <- FindAllMarkers(
+  seu,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  verbose = FALSE
+)
+
+m_path <- file.path(out_dir, "cluster_markers_res0.3.csv")
+data.table::fwrite(as.data.table(markers), m_path)
+log_msg("Saved:", m_path)
+```
+
+```{r}
+# scripts/07_scrna_annotate_singleR.R
+
+source("scripts/00_setup_paths.R")
+
+required_pkgs <- c("Seurat", "SeuratObject", "SingleR", "celldex", "SummarizedExperiment", "data.table")
+missing <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
+  stop("Missing packages: ", paste(missing, collapse = ", "))
+}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(SingleR)
+  library(celldex)
+  library(SummarizedExperiment)
+  library(data.table)
+})
+
+in_proc <- file.path(DIR_RESULTS, "scrna", "scrna_seurat_proc.rds")
+stopifnot(file.exists(in_proc))
+
+seu <- readRDS(in_proc)
+DefaultAssay(seu) <- "RNA"
+
+# Seurat v5: ensure layers are joined so GetAssayData works for DE/exports
+seu <- JoinLayers(seu)
+
+# Use log-normalized data for SingleR
+logcounts <- GetAssayData(seu, layer = "data")
+stopifnot(ncol(logcounts) == ncol(seu))
+
+# Reference: Human Primary Cell Atlas (broad cell types)
+ref <- celldex::HumanPrimaryCellAtlasData()
+
+log_msg("Running SingleR (cell-level)")
+pred <- SingleR(
+  test = logcounts,
+  ref = ref,
+  labels = ref$label.main,
+  assay.type.test = "logcounts"
+)
+
+# Store in Seurat metadata
+seu$SingleR_label <- pred$labels
+seu$SingleR_pruned <- pred$pruned.labels
+
+# Cluster-level majority label (using pruned if available)
+cl <- as.character(Idents(seu))
+lab_use <- ifelse(is.na(seu$SingleR_pruned), seu$SingleR_label, seu$SingleR_pruned)
+
+cluster_labels <- tapply(lab_use, cl, function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[1]
+})
+
+seu$SingleR_cluster_label <- cluster_labels[cl]
+
+out_dir <- file.path(DIR_RESULTS, "scrna")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Save predictions
+cell_out <- data.table(
+  cell = colnames(seu),
+  cluster = cl,
+  SingleR_label = seu$SingleR_label,
+  SingleR_pruned = seu$SingleR_pruned,
+  SingleR_cluster_label = seu$SingleR_cluster_label,
+  Sample = if ("Sample" %in% colnames(seu@meta.data)) as.character(seu$Sample) else NA_character_
+)
+
+data.table::fwrite(cell_out, file.path(out_dir, "singleR_cell_labels.csv"))
+
+cl_out <- data.table(
+  cluster = names(cluster_labels),
+  SingleR_cluster_label = as.character(cluster_labels),
+  n_cells = as.integer(table(cl)[names(cluster_labels)])
+)
+
+data.table::fwrite(cl_out, file.path(out_dir, "singleR_cluster_labels.csv"))
+
+# Save updated Seurat object
+out_rds <- file.path(out_dir, "scrna_seurat_annot_singleR.rds")
+saveRDS(seu, out_rds)
+
+log_msg("Saved: singleR_cell_labels.csv")
+log_msg("Saved: singleR_cluster_labels.csv")
+log_msg("Saved:", out_rds)
+
+# Quick summary
+tab <- sort(table(seu$SingleR_cluster_label), decreasing = TRUE)
+log_msg("Cluster-label summary:", paste(names(tab), as.integer(tab), sep = "=", collapse = " | "))
+
+
+```
+
+```{r}
+# scripts/08_build_reference_from_singleR.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(Matrix)
+  library(data.table)
+})
+
+in_rds <- file.path(DIR_RESULTS, "scrna", "scrna_seurat_annot_singleR.rds")
+stopifnot(file.exists(in_rds))
+
+seu <- readRDS(in_rds)
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+
+# Use cluster-level SingleR label (stable)
+lab <- as.character(seu$SingleR_cluster_label)
+stopifnot(length(lab) == ncol(seu))
+
+# Collapse SingleR labels to broad compartments for joint modeling
+lab <- as.character(seu$SingleR_cluster_label)
+stopifnot(length(lab) == ncol(seu))
+
+comp <- rep("Other", length(lab))
+
+# Immune
+comp[lab %in% c("T_cells")] <- "T_cells"
+comp[lab %in% c("B_cell")] <- "B_cells"
+comp[lab %in% c("Macrophage", "CMP")] <- "Myeloid"
+
+# Major non-immune
+comp[lab %in% c("Epithelial_cells")] <- "Epithelial"
+comp[lab %in% c("Endothelial_cells")] <- "Endothelial"
+comp[lab %in% c("Smooth_muscle_cells")] <- "Stromal"
+
+# Everything else stays "Other" (e.g., Tissue_stem_cells, Neurons, etc.)
+seu$cellcompartment <- factor(
+  comp,
+  levels = c("T_cells", "B_cells", "Myeloid", "Epithelial", "Stromal", "Endothelial", "Other")
+)
+
+tab <- sort(table(seu$cellcompartment), decreasing = TRUE)
+log_msg("Cells per compartment:", paste(names(tab), as.integer(tab), sep="=", collapse=" | "))
+
+# Build reference: average log-normalized expression per compartment
+data_mat <- GetAssayData(seu, layer = "data")
+stopifnot(ncol(data_mat) == ncol(seu))
+
+groups <- seu$cellcompartment
+ref <- sapply(levels(groups), function(g) {
+  cells_g <- which(groups == g)
+  Matrix::rowMeans(data_mat[, cells_g, drop = FALSE])
+})
+
+out_dir <- file.path(DIR_RESULTS, "references")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(ref, file.path(out_dir, "reference_logexpr_compartments_singleR.rds"))
+data.table::fwrite(
+  data.table(gene = rownames(ref), ref),
+  file.path(out_dir, "reference_logexpr_compartments_singleR.csv")
+)
+
+# Save Seurat with compartments
+saveRDS(seu, file.path(DIR_RESULTS, "scrna", "scrna_seurat_compartments_singleR.rds"))
+
+log_msg("Saved: reference_logexpr_compartments_singleR.rds")
+log_msg("Saved: reference_logexpr_compartments_singleR.csv")
+log_msg("Saved: scrna_seurat_compartments_singleR.rds")
+log_msg("Reference dims (genes x compartments):", nrow(ref), "x", ncol(ref))
+```
+
+
+```{r}
+# scripts/09_harmonize_bulk_reference_genes.R
+
+source("scripts/00_setup_paths.R")
+
+bulk_path <- file.path(DIR_RESULTS, "bulk", "bulk_tpm_matrix_M0M1.rds")
+ref_path  <- file.path(DIR_RESULTS, "references", "reference_logexpr_compartments_singleR.rds")
+
+stopifnot(file.exists(bulk_path))
+stopifnot(file.exists(ref_path))
+
+bulk <- readRDS(bulk_path)   # genes x samples (TPM)
+ref  <- readRDS(ref_path)    # genes x compartments (log-normalized)
+
+bulk_genes <- rownames(bulk)
+ref_genes  <- rownames(ref)
+
+common <- intersect(bulk_genes, ref_genes)
+stopifnot(length(common) > 0)
+
+bulk2 <- bulk[common, , drop = FALSE]
+ref2  <- ref[common, , drop = FALSE]
+
+out_dir <- file.path(DIR_RESULTS, "aligned")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(bulk2, file.path(out_dir, "bulk_tpm_common_genes.rds"))
+saveRDS(ref2,  file.path(out_dir, "ref_logexpr_common_genes.rds"))
+
+log_msg("Common genes:", length(common))
+log_msg("Aligned dims bulk (genes x samples):", nrow(bulk2), "x", ncol(bulk2))
+log_msg("Aligned dims ref  (genes x compartments):", nrow(ref2), "x", ncol(ref2))
+log_msg("Saved: bulk_tpm_common_genes.rds")
+log_msg("Saved: ref_logexpr_common_genes.rds")
+```
+
+```{r}
+# scripts/10_run_music.R
+
+source("scripts/00_setup_paths.R")
+
+required_pkgs <- c("MuSiC", "SingleCellExperiment", "Seurat", "SeuratObject", "data.table")
+missing <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) stop("Missing packages: ", paste(missing, collapse = ", "))
+
+suppressPackageStartupMessages({
+  library(MuSiC)
+  library(SingleCellExperiment)
+  library(Seurat)
+  library(SeuratObject)
+  library(data.table)
+})
+
+bulk_path <- file.path(DIR_RESULTS, "aligned", "bulk_tpm_common_genes.rds")
+seu_path  <- file.path(DIR_RESULTS, "scrna", "scrna_seurat_compartments_singleR.rds")
+
+stopifnot(file.exists(bulk_path))
+stopifnot(file.exists(seu_path))
+
+bulk <- readRDS(bulk_path)  # genes x samples (TPM), already aligned to reference genes
+seu <- readRDS(seu_path)
+
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+
+stopifnot("cellcompartment" %in% colnames(seu@meta.data))
+stopifnot("Sample" %in% colnames(seu@meta.data))
+
+# Convert to SingleCellExperiment for MuSiC
+sce <- as.SingleCellExperiment(seu)
+
+# MuSiC expects:
+# - bulk: ExpressionSet-like matrix with genes as rownames and samples as colnames
+# - sc: single-cell expression with celltype and sample identifiers
+celltypes <- as.character(colData(sce)$cellcompartment)
+samples   <- as.character(colData(sce)$Sample)
+
+stopifnot(length(celltypes) == ncol(sce))
+stopifnot(length(samples) == ncol(sce))
+
+log_msg("Running MuSiC")
+res <- music_prop(
+  bulk.mtx = bulk,
+  sc.sce = sce,
+  clusters = "cellcompartment",
+  samples = "Sample",
+  verbose = FALSE
+)
+
+out_dir <- file.path(DIR_RESULTS, "deconv", "music")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(res, file.path(out_dir, "music_result.rds"))
+
+# Extract proportions
+props <- as.data.frame(res$Est.prop.weighted)
+props$sample <- rownames(props)
+
+data.table::fwrite(as.data.table(props), file.path(out_dir, "music_proportions.csv"))
+
+log_msg("Saved: music_result.rds")
+log_msg("Saved: music_proportions.csv")
+log_msg("Output rows (samples):", nrow(props))
+log_msg("Output cols (compartments + sample):", ncol(props))
+```
+
+```{r}
+library(data.table)
+
+props <- fread("results/deconv/music/music_proportions.csv")
+head(props)
+summary(props)
+row_sums <- rowSums(props[, !("sample"), with = FALSE])
+summary(row_sums)
+
+boxplot(props[, !("sample"), with = FALSE],
+        las = 2,
+        main = "MuSiC estimated proportions",
+        ylab = "Estimated proportion")
+```
+
+
+
+```{r}
+# scripts/11_run_epic.R
+
+source("scripts/00_setup_paths.R")
+
+required_pkgs <- c("EPIC", "Seurat", "SeuratObject", "Matrix", "data.table")
+missing <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) stop("Missing packages: ", paste(missing, collapse = ", "))
+
+suppressPackageStartupMessages({
+  library(EPIC)
+  library(Seurat)
+  library(SeuratObject)
+  library(Matrix)
+  library(data.table)
+})
+
+bulk_path <- file.path(DIR_RESULTS, "bulk", "bulk_tpm_matrix_M0M1.rds")
+seu_path  <- file.path(DIR_RESULTS, "scrna", "scrna_seurat_compartments_singleR.rds")
+
+stopifnot(file.exists(bulk_path))
+stopifnot(file.exists(seu_path))
+
+bulk <- readRDS(bulk_path)  # genes x samples (TPM)
+seu  <- readRDS(seu_path)
+
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+
+stopifnot("cellcompartment" %in% colnames(seu@meta.data))
+
+log_msg("Building EPIC reference (CPM) from scRNA counts")
+
+counts <- GetAssayData(seu, layer = "counts")
+groups <- factor(seu$cellcompartment)
+
+# CPM per cell
+cpm <- t( t(counts) / Matrix::colSums(counts) ) * 1e6
+
+# Average CPM per compartment
+ref_epic <- sapply(levels(groups), function(g) {
+  idx <- which(groups == g)
+  Matrix::rowMeans(cpm[, idx, drop = FALSE])
+})
+
+# Gene-wise variance per compartment (for EPIC weighting)
+ref_var <- sapply(levels(groups), function(g) {
+  idx <- which(groups == g)
+  if (length(idx) > 1) {
+    apply(cpm[, idx, drop = FALSE], 1, var)
+  } else {
+    rep(0, nrow(cpm))
+  }
+})
+
+rownames(ref_var) <- rownames(cpm)
+
+common <- intersect(rownames(bulk), rownames(ref_epic))
+stopifnot(length(common) > 0)
+
+bulk2 <- bulk[common, , drop = FALSE]
+ref2  <- ref_epic[common, , drop = FALSE]
+
+log_msg("Common genes:", length(common))
+log_msg("Bulk dims (genes x samples):", nrow(bulk2), "x", ncol(bulk2))
+log_msg("Ref dims  (genes x compartments):", nrow(ref2), "x", ncol(ref2))
+
+# EPIC reference format
+ref_list <- list(
+  refProfiles = ref2,
+  refProfiles.var = ref_var[rownames(ref2), colnames(ref2), drop = FALSE],
+  sigGenes = rownames(ref2)
+)
+
+log_msg("Running EPIC")
+res <- EPIC::EPIC(bulk = bulk2, reference = ref_list)
+
+out_dir <- file.path(DIR_RESULTS, "deconv", "epic")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(res, file.path(out_dir, "epic_result.rds"))
+
+props <- as.data.frame(res$cellFractions)
+props$sample <- rownames(props)
+data.table::fwrite(as.data.table(props), file.path(out_dir, "epic_proportions.csv"))
+
+if (!is.null(res$fit.gof)) {
+  fg <- as.data.frame(res$fit.gof)
+  fg$sample <- rownames(fg)
+  data.table::fwrite(as.data.table(fg), file.path(out_dir, "epic_fit_gof.csv"))
+}
+
+log_msg("Saved: epic_result.rds")
+log_msg("Saved: epic_proportions.csv")
+log_msg("Saved: epic_fit_gof.csv")
+
+```
+
+```{r}
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+})
+
+log_msg("Loading PBMC 3k dataset")
+
+pbmc_dir <- file.path(
+  DIR_DATA,
+  "scrna",
+  "pbmc",
+  "pbmc3k",
+  "filtered_feature_bc_matrix"
+)
+
+stopifnot(dir.exists(pbmc_dir))
+
+counts <- Read10X(pbmc_dir)
+
+pbmc <- CreateSeuratObject(
+  counts = counts,
+  project = "PBMC3K",
+  min.cells = 0,
+  min.features = 0
+)
+
+log_msg("PBMC dims (genes x cells):", nrow(pbmc), "x", ncol(pbmc))
+
+out_dir <- file.path(DIR_RESULTS, "pbmc")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_file <- file.path(out_dir, "pbmc3k_seurat_raw.rds")
+
+saveRDS(pbmc, out_file)
+
+log_msg("Saved:", out_file)
+```
+
+
+```{r}
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+})
+
+log_msg("Loading PBMC object")
+
+pbmc <- readRDS(file.path(DIR_RESULTS, "pbmc", "pbmc3k_seurat_raw.rds"))
+
+log_msg("Input dims:", nrow(pbmc), "x", ncol(pbmc))
+
+pbmc <- NormalizeData(pbmc)
+
+pbmc <- FindVariableFeatures(pbmc)
+
+pbmc <- ScaleData(pbmc)
+
+pbmc <- RunPCA(pbmc)
+
+pbmc <- RunUMAP(pbmc, dims = 1:20)
+
+pbmc <- FindNeighbors(pbmc, dims = 1:20)
+
+pbmc <- FindClusters(pbmc, resolution = 0.5)
+
+out_file <- file.path(DIR_RESULTS, "pbmc", "pbmc3k_seurat_processed.rds")
+
+saveRDS(pbmc, out_file)
+
+log_msg("Clusters:", paste(names(table(pbmc$seurat_clusters)),
+                           as.integer(table(pbmc$seurat_clusters)),
+                           sep="=", collapse=" | "))
+
+log_msg("Saved:", out_file)
+```
+
+```{r}
+# scripts/14_pbmc_singleR_annotation.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(SingleR)
+  library(celldex)
+  library(data.table)
+})
+
+pbmc_path <- file.path(DIR_RESULTS,"pbmc","pbmc3k_seurat_processed.rds")
+stopifnot(file.exists(pbmc_path))
+
+pbmc <- readRDS(pbmc_path)
+
+DefaultAssay(pbmc) <- "RNA"
+pbmc <- JoinLayers(pbmc)
+
+logcounts <- GetAssayData(pbmc, layer="data")
+
+ref <- celldex::HumanPrimaryCellAtlasData()
+
+log_msg("Running SingleR on PBMC")
+
+pred <- SingleR(
+  test = logcounts,
+  ref = ref,
+  labels = ref$label.main,
+  assay.type.test = "logcounts"
+)
+
+pbmc$SingleR_label <- pred$labels
+pbmc$SingleR_pruned <- pred$pruned.labels
+
+lab_use <- ifelse(is.na(pbmc$SingleR_pruned),
+                  pbmc$SingleR_label,
+                  pbmc$SingleR_pruned)
+
+cl <- as.character(Idents(pbmc))
+
+cluster_labels <- tapply(lab_use, cl, function(x){
+  x <- x[!is.na(x)]
+  if(length(x)==0) return(NA_character_)
+  names(sort(table(x), decreasing=TRUE))[1]
+})
+
+pbmc$SingleR_cluster_label <- cluster_labels[cl]
+
+out <- file.path(DIR_RESULTS,"pbmc","pbmc3k_seurat_singleR.rds")
+saveRDS(pbmc,out)
+
+tab <- sort(table(pbmc$SingleR_cluster_label), decreasing=TRUE)
+
+log_msg("Cluster-label summary:",
+        paste(names(tab),as.integer(tab),sep="=",collapse=" | "))
+
+log_msg("Saved:",out)
+```
+
+```{r}
+# scripts/15_pbmc_build_reference_from_singleR.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(Matrix)
+})
+
+in_rds <- file.path(DIR_RESULTS, "pbmc", "pbmc3k_seurat_singleR.rds")
+stopifnot(file.exists(in_rds))
+
+seu <- readRDS(in_rds)
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+
+stopifnot("SingleR_cluster_label" %in% colnames(seu@meta.data))
+
+# Keep only major labels we want to validate
+keep <- c("T_cells","B_cell","Monocyte","NK_cell","Platelets")
+seu <- subset(seu, subset = SingleR_cluster_label %in% keep)
+
+# Map to compartments (PBMC has no epithelial/stromal/endothelial)
+seu$cellcompartment <- as.character(seu$SingleR_cluster_label)
+seu$cellcompartment[seu$cellcompartment == "B_cell"] <- "B_cells"
+seu$cellcompartment[seu$cellcompartment == "Monocyte"] <- "Myeloid"
+seu$cellcompartment[seu$cellcompartment == "NK_cell"] <- "T_cells"  # NK grouped with lymphocytes for validation
+seu$cellcompartment[seu$cellcompartment == "Platelets"] <- "Other"
+
+seu$cellcompartment <- factor(seu$cellcompartment, levels = c("T_cells","B_cells","Myeloid","Other"))
+
+logcounts <- GetAssayData(seu, layer = "data")
+
+ref <- sapply(levels(seu$cellcompartment), function(g) {
+  cells <- colnames(seu)[seu$cellcompartment == g]
+  Matrix::rowMeans(logcounts[, cells, drop = FALSE])
+})
+
+out_dir <- file.path(DIR_RESULTS, "pbmc", "reference")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_rds <- file.path(out_dir, "pbmc_reference_logexpr.rds")
+saveRDS(ref, out_rds)
+
+log_msg("Reference dims (genes x compartments):", nrow(ref), "x", ncol(ref))
+log_msg("Saved:", out_rds)
+```
+
+```{r}
+# scripts/16_pbmc_make_pseudobulk.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(Matrix)
+  library(data.table)
+})
+
+set.seed(1)
+
+in_rds <- file.path(DIR_RESULTS, "pbmc", "pbmc3k_seurat_singleR.rds")
+stopifnot(file.exists(in_rds))
+
+seu <- readRDS(in_rds)
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+
+stopifnot("SingleR_cluster_label" %in% colnames(seu@meta.data))
+
+# Map to 3 compartments (Platelets merged to Myeloid; no "Other")
+seu$cellcompartment <- as.character(seu$SingleR_cluster_label)
+seu$cellcompartment[seu$cellcompartment == "B_cell"] <- "B_cells"
+seu$cellcompartment[seu$cellcompartment == "Monocyte"] <- "Myeloid"
+seu$cellcompartment[seu$cellcompartment == "NK_cell"] <- "T_cells"
+seu$cellcompartment[seu$cellcompartment == "Platelets"] <- "Myeloid"
+
+seu$cellcompartment <- factor(seu$cellcompartment, levels = c("T_cells","B_cells","Myeloid"))
+
+counts <- GetAssayData(seu, layer = "counts")
+comp <- seu$cellcompartment
+stopifnot(length(comp) == ncol(counts))
+
+cells_by_comp <- split(colnames(seu), comp)
+stopifnot(all(c("T_cells","B_cells","Myeloid") %in% names(cells_by_comp)))
+stopifnot(all(vapply(cells_by_comp[c("T_cells","B_cells","Myeloid")], length, integer(1)) > 0))
+
+n_pseudobulk  <- 40
+cells_per_mix <- 2000
+
+truth <- data.table(
+  mix     = paste0("mix_", sprintf("%03d", 1:n_pseudobulk)),
+  T_cells = runif(n_pseudobulk, 0.30, 0.70),
+  B_cells = runif(n_pseudobulk, 0.02, 0.20),
+  Myeloid = runif(n_pseudobulk, 0.10, 0.60)
+)
+
+truth[, c("T_cells","B_cells","Myeloid") :=
+        lapply(.SD, function(x) x / rowSums(.SD)),
+      .SDcols = c("T_cells","B_cells","Myeloid")]
+
+mix_mat <- Matrix(0,
+  nrow = nrow(counts),
+  ncol = n_pseudobulk,
+  dimnames = list(rownames(counts), truth$mix),
+  sparse = TRUE
+)
+
+for (i in seq_len(n_pseudobulk)) {
+  p <- as.numeric(truth[i, .(T_cells, B_cells, Myeloid)])
+  names(p) <- c("T_cells","B_cells","Myeloid")
+
+  n_pick <- floor(p * cells_per_mix)
+  names(n_pick) <- names(p)
+
+  leftover <- cells_per_mix - sum(n_pick)
+  frac <- (p * cells_per_mix) - n_pick
+  ord <- names(sort(frac, decreasing = TRUE))
+
+  if (leftover > 0) {
+    for (k in seq_len(leftover)) {
+      n_pick[ord[((k - 1) %% length(ord)) + 1]] <- n_pick[ord[((k - 1) %% length(ord)) + 1]] + 1
+    }
+  }
+
+  stopifnot(sum(n_pick) == cells_per_mix)
+  stopifnot(all(n_pick >= 0))
+
+  picked <- c(
+    sample(cells_by_comp[["T_cells"]],  n_pick["T_cells"],  replace = TRUE),
+    sample(cells_by_comp[["B_cells"]],  n_pick["B_cells"],  replace = TRUE),
+    sample(cells_by_comp[["Myeloid"]],  n_pick["Myeloid"],  replace = TRUE)
+  )
+
+  mix_mat[, i] <- Matrix::rowSums(counts[, picked, drop = FALSE])
+}
+
+out_dir <- file.path(DIR_RESULTS, "pbmc", "pseudobulk")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(mix_mat, file.path(out_dir, "pbmc_pseudobulk_counts.rds"))
+fwrite(truth, file.path(out_dir, "pbmc_pseudobulk_truth.csv"))
+
+log_msg("Pseudo-bulk dims (genes x mixes):", nrow(mix_mat), "x", ncol(mix_mat))
+log_msg("Saved:", file.path(out_dir, "pbmc_pseudobulk_counts.rds"))
+log_msg("Saved:", file.path(out_dir, "pbmc_pseudobulk_truth.csv"))
+```
+
+```{r}
+# scripts/17_pbmc_run_music.R
+
+source("scripts/00_setup_paths.R")
+
+required_pkgs <- c("MuSiC", "SingleCellExperiment", "Seurat", "SeuratObject", "data.table")
+missing <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) stop("Missing packages: ", paste(missing, collapse = ", "))
+
+suppressPackageStartupMessages({
+  library(MuSiC)
+  library(SingleCellExperiment)
+  library(Seurat)
+  library(SeuratObject)
+  library(data.table)
+})
+
+bulk_path <- file.path(DIR_RESULTS, "pbmc", "pseudobulk", "pbmc_pseudobulk_counts.rds")
+seu_path  <- file.path(DIR_RESULTS, "pbmc", "pbmc3k_seurat_singleR.rds")
+
+stopifnot(file.exists(bulk_path))
+stopifnot(file.exists(seu_path))
+
+bulk <- readRDS(bulk_path)
+bulk <- as.matrix(bulk)
+stopifnot(nrow(bulk) > 1, ncol(bulk) > 1)
+
+seu <- readRDS(seu_path)
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+
+stopifnot("SingleR_cluster_label" %in% colnames(seu@meta.data))
+
+# Same compartments as your pipeline
+seu$cellcompartment <- as.character(seu$SingleR_cluster_label)
+seu$cellcompartment[seu$cellcompartment == "B_cell"] <- "B_cells"
+seu$cellcompartment[seu$cellcompartment == "Monocyte"] <- "Myeloid"
+seu$cellcompartment[seu$cellcompartment == "NK_cell"] <- "T_cells"
+seu$cellcompartment[seu$cellcompartment == "Platelets"] <- "Other"
+seu$cellcompartment <- factor(seu$cellcompartment, levels = c("T_cells","B_cells","Myeloid","Other"))
+
+# MuSiC needs >1 sample; create 5 pseudo-samples balanced within each compartment
+set.seed(1)
+seu$Sample <- NA_character_
+
+for (g in levels(seu$cellcompartment)) {
+  cells <- colnames(seu)[seu$cellcompartment == g]
+  k <- 5
+  reps <- paste0("PBMC_rep", rep(1:k, length.out = length(cells)))
+  reps <- sample(reps, length(reps), replace = FALSE)
+  seu$Sample[match(cells, colnames(seu))] <- reps
+}
+
+stopifnot(!anyNA(seu$Sample))
+
+sce <- as.SingleCellExperiment(seu)
+
+log_msg("Running MuSiC")
+res <- music_prop(
+  bulk.mtx = bulk,
+  sc.sce = sce,
+  clusters = "cellcompartment",
+  samples = "Sample",
+  verbose = FALSE
+)
+
+out_dir <- file.path(DIR_RESULTS, "pbmc", "music")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(res, file.path(out_dir, "music_result.rds"))
+
+props <- as.data.frame(res$Est.prop.weighted)
+props$sample <- rownames(props)
+
+data.table::fwrite(as.data.table(props), file.path(out_dir, "music_proportions.csv"))
+
+log_msg("Saved: music_result.rds")
+log_msg("Saved: music_proportions.csv")
+log_msg("Output rows (mixes):", nrow(props))
+log_msg("Output cols (compartments + sample):", ncol(props))
+```
+
+```{r}
+# scripts/18_pbmc_run_epic.R
+
+source("scripts/00_setup_paths.R")
+
+required_pkgs <- c("EPIC","Seurat","SeuratObject","Matrix","data.table")
+missing <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly=TRUE)]
+if(length(missing)>0) stop("Missing packages: ", paste(missing, collapse=", "))
+
+suppressPackageStartupMessages({
+  library(EPIC)
+  library(Seurat)
+  library(SeuratObject)
+  library(Matrix)
+  library(data.table)
+})
+
+bulk_path <- file.path(DIR_RESULTS,"pbmc","pseudobulk","pbmc_pseudobulk_counts.rds")
+seu_path  <- file.path(DIR_RESULTS,"pbmc","pbmc3k_seurat_singleR.rds")
+
+stopifnot(file.exists(bulk_path))
+stopifnot(file.exists(seu_path))
+
+bulk <- readRDS(bulk_path)
+bulk <- as.matrix(bulk)
+
+seu <- readRDS(seu_path)
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+
+# same 3-compartment mapping used for MuSiC validation
+seu$cellcompartment <- as.character(seu$SingleR_cluster_label)
+seu$cellcompartment[seu$cellcompartment=="B_cell"] <- "B_cells"
+seu$cellcompartment[seu$cellcompartment=="Monocyte"] <- "Myeloid"
+seu$cellcompartment[seu$cellcompartment=="NK_cell"] <- "T_cells"
+seu$cellcompartment[seu$cellcompartment=="Platelets"] <- "Myeloid"
+seu$cellcompartment <- factor(seu$cellcompartment, levels=c("T_cells","B_cells","Myeloid"))
+
+counts <- GetAssayData(seu, layer="counts")
+
+# EPIC expects gene expression profiles per cell type + signature genes
+profiles <- sapply(levels(seu$cellcompartment), function(g){
+  cells <- colnames(seu)[seu$cellcompartment==g]
+  Matrix::rowMeans(counts[, cells, drop=FALSE])
+})
+
+# Variance per gene per cell type (needed by EPIC; same dimnames as profiles)
+profiles_var <- sapply(levels(seu$cellcompartment), function(g){
+  cells <- colnames(seu)[seu$cellcompartment==g]
+  if(length(cells) < 2) return(rep(0, nrow(counts)))
+  apply(counts[, cells, drop=FALSE], 1, stats::var)
+})
+
+rownames(profiles_var) <- rownames(profiles)
+colnames(profiles_var) <- colnames(profiles)
+
+# Signature genes: union of top DEGs per cell type (simple + stable)
+logdata <- GetAssayData(seu, layer="data")
+sig <- character(0)
+
+for (g in levels(seu$cellcompartment)) {
+  cells_g <- colnames(seu)[seu$cellcompartment==g]
+  cells_o <- colnames(seu)[seu$cellcompartment!=g]
+
+  m1 <- Matrix::rowMeans(logdata[, cells_g, drop=FALSE])
+  m0 <- Matrix::rowMeans(logdata[, cells_o, drop=FALSE])
+  d  <- m1 - m0
+
+  top <- names(sort(d, decreasing=TRUE))[1:300]
+  sig <- union(sig, top)
+}
+
+sig <- intersect(sig, rownames(bulk))
+
+ref_list <- list(
+  refProfiles = profiles,
+  refProfiles.var = profiles_var,
+  sigGenes = sig
+)
+
+# Align genes between bulk and reference
+common <- intersect(rownames(bulk), rownames(ref_list$refProfiles))
+stopifnot(length(common) > 1000)
+
+bulk2 <- bulk[common, , drop=FALSE]
+ref_list$refProfiles <- ref_list$refProfiles[common, , drop=FALSE]
+ref_list$refProfiles.var <- ref_list$refProfiles.var[common, , drop=FALSE]
+ref_list$sigGenes <- intersect(ref_list$sigGenes, common)
+
+log_msg("Running EPIC (PBMC validation, 3 compartments)")
+res <- EPIC::EPIC(bulk = bulk2, reference = ref_list)
+
+out_dir <- file.path(DIR_RESULTS,"pbmc","epic")
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+
+saveRDS(res, file.path(out_dir,"epic_result.rds"))
+
+props <- as.data.frame(t(res$cellFractions))
+props$mix <- rownames(props)
+
+fwrite(as.data.table(props), file.path(out_dir,"epic_proportions.csv"))
+
+log_msg("Saved:", file.path(out_dir,"epic_result.rds"))
+log_msg("Saved:", file.path(out_dir,"epic_proportions.csv"))
+
+if (!is.null(res$fit.gof)) {
+  fwrite(as.data.table(res$fit.gof), file.path(out_dir,"epic_fit_gof.csv"))
+  log_msg("Saved:", file.path(out_dir,"epic_fit_gof.csv"))
+}
+```
+
+```{r}
+epic <- data.table::fread("results/pbmc/epic/epic_proportions.csv")
+
+epic_mat <- as.matrix(epic[, !"mix"])
+
+rownames(epic_mat) <- epic$mix
+
+summary(t(epic_mat))
+```
+
+
+```{r}
+# scripts/19_show_pbmc_results.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+music_path <- file.path(DIR_RESULTS,"pbmc","music","music_proportions.csv")
+epic_path  <- file.path(DIR_RESULTS,"pbmc","epic","epic_proportions.csv")
+
+stopifnot(file.exists(music_path))
+stopifnot(file.exists(epic_path))
+
+music <- fread(music_path)
+epic_raw <- fread(epic_path)
+
+# ---- MuSiC ----
+log_msg("MuSiC column names:")
+print(colnames(music))
+
+music_cols <- setdiff(colnames(music), c("mix","sample"))
+log_msg("MuSiC summary (all compartments):")
+print(summary(music[, ..music_cols]))
+
+# ---- EPIC (fix inverted format) ----
+# Current format: columns are mix_001..mix_040, and a 'mix' column holds row labels (cell types)
+stopifnot("mix" %in% colnames(epic_raw))
+
+epic_mat <- as.matrix(epic_raw[, !"mix"])
+rownames(epic_mat) <- epic_raw$mix
+
+# Now transpose so rows=mixes and cols=cell types
+epic <- as.data.table(t(epic_mat), keep.rownames = "mix")
+
+log_msg("EPIC column names (fixed):")
+print(colnames(epic))
+
+epic_cols <- setdiff(colnames(epic), "mix")
+log_msg("EPIC summary (all compartments):")
+print(summary(epic[, ..epic_cols]))
+```
+
+
+
+```{r}
+# scripts/20_run_bisque.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(BisqueRNA)
+  library(Biobase)
+  library(data.table)
+})
+
+set.seed(1)
+
+log_msg("Running Bisque deconvolution")
+
+# -----------------------------
+# Load aligned matrices
+# -----------------------------
+
+bulk <- readRDS(file.path(DIR_RESULTS, "aligned", "bulk_tpm_common_genes.rds"))
+
+sce  <- readRDS(file.path(DIR_RESULTS, "scrna", "scrna_seurat_annot_singleR.rds"))
+
+log_msg("Bulk dims (genes x samples):", nrow(bulk), "x", ncol(bulk))
+log_msg("scRNA dims (genes x cells):", nrow(sce), "x", ncol(sce))
+
+# -----------------------------
+# Extract counts from Seurat
+# -----------------------------
+
+DefaultAssay(sce) <- "RNA"
+sce <- JoinLayers(sce)
+
+DefaultAssay(sce) <- "RNA"
+sce <- JoinLayers(sce)
+
+counts <- GetAssayData(sce, layer = "counts")
+
+meta <- sce@meta.data
+
+meta$cellcompartment <- as.character(meta$SingleR_cluster_label)
+
+# Immune
+meta$cellcompartment[meta$cellcompartment == "B_cell"] <- "B_cells"
+meta$cellcompartment[meta$cellcompartment == "Macrophage"] <- "Myeloid"
+meta$cellcompartment[meta$cellcompartment == "CMP"] <- "Myeloid"
+
+# Major non-immune
+meta$cellcompartment[meta$cellcompartment == "Epithelial_cells"] <- "Epithelial"
+meta$cellcompartment[meta$cellcompartment == "Endothelial_cells"] <- "Endothelial"
+meta$cellcompartment[meta$cellcompartment == "Smooth_muscle_cells"] <- "Stromal"
+
+# Everything else
+meta$cellcompartment[meta$cellcompartment %in% c("Tissue_stem_cells", "Neurons")] <- "Other"
+
+meta$cellcompartment <- factor(
+  meta$cellcompartment,
+  levels = c(
+    "T_cells",
+    "B_cells",
+    "Myeloid",
+    "Epithelial",
+    "Stromal",
+    "Endothelial",
+    "Other"
+  )
+)
+
+sce$cellcompartment <- meta$cellcompartment
+
+print(table(sce$cellcompartment))
+
+stopifnot("cellcompartment" %in% colnames(sce@meta.data))
+stopifnot("Sample" %in% colnames(sce@meta.data))
+
+# -----------------------------
+# Build ExpressionSet objects
+# -----------------------------
+
+log_msg("Building ExpressionSet objects")
+
+bulk_eset <- ExpressionSet(
+  assayData = as.matrix(bulk)
+)
+
+sc_eset <- ExpressionSet(
+  assayData = as.matrix(counts),
+  phenoData = AnnotatedDataFrame(
+    data.frame(
+      cellcompartment = meta$cellcompartment,
+      Sample = meta$Sample,
+      row.names = colnames(counts)
+    )
+  )
+)
+
+log_msg("bulk_eset dims:", nrow(exprs(bulk_eset)), "x", ncol(exprs(bulk_eset)))
+log_msg("sc_eset dims:", nrow(exprs(sc_eset)), "x", ncol(exprs(sc_eset)))
+
+# -----------------------------
+# Run Bisque
+# -----------------------------
+
+log_msg("Running ReferenceBasedDecomposition")
+
+res <- BisqueRNA::ReferenceBasedDecomposition(
+  bulk.eset = bulk_eset,
+  sc.eset = sc_eset,
+  cell.types = "cellcompartment",
+  subject.names = "Sample",
+  use.overlap = FALSE,
+  verbose = TRUE
+)
+
+# -----------------------------
+# Extract proportions
+# -----------------------------
+
+props <- as.data.frame(t(res$bulk.props))
+
+props$sample <- rownames(props)
+
+# reorder columns (sample first)
+props <- props[, c("sample", setdiff(colnames(props), "sample"))]
+
+log_msg("Output rows (samples):", nrow(props))
+log_msg("Output cols:", ncol(props))
+
+# -----------------------------
+# Save results
+# -----------------------------
+
+out_dir <- file.path(DIR_RESULTS, "deconv", "bisque")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(res, file.path(out_dir, "bisque_result.rds"))
+
+data.table::fwrite(
+  props,
+  file.path(out_dir, "bisque_proportions.csv")
+)
+
+log_msg("Saved: bisque_result.rds")
+log_msg("Saved: bisque_proportions.csv")
+
+# -----------------------------
+# Quick summary
+# -----------------------------
+
+log_msg("Summary of proportions")
+
+print(summary(props[, setdiff(colnames(props), "sample")]))
+```
+
+```{r}
+bisque <- read.csv("results/deconv/bisque/bisque_proportions.csv",
+                   row.names = 1,
+                   check.names = FALSE)
+
+bisque_mat <- as.matrix(bisque)
+
+summary(t(bisque_mat))
+```
+
+```{r}
+library(data.table)
+music  <- fread("results/deconv/music/music_proportions.csv")
+epic   <- fread("results/deconv/epic/epic_proportions.csv")
+bisque <- fread("results/deconv/bisque/bisque_proportions.csv")
+summary(music[, .(T_cells, B_cells, Myeloid, Epithelial, Stromal, Endothelial, Other)])
+summary(epic[, .(T_cells, B_cells, Myeloid, Epithelial, Stromal, Endothelial, Other, otherCells)])
+summary(bisque[, .(T_cells, B_cells, Myeloid, Epithelial, Stromal, Endothelial, Other)])
+music_means <- colMeans(music[, .(T_cells, B_cells, Myeloid, Epithelial, Stromal, Endothelial, Other)])
+epic_means  <- colMeans(epic[, .(T_cells, B_cells, Myeloid, Epithelial, Stromal, Endothelial, Other)])
+bisque_means <- colMeans(bisque[, .(T_cells, B_cells, Myeloid, Epithelial, Stromal, Endothelial, Other)])
+rbind(
+MuSiC = music_means,
+EPIC = epic_means,
+Bisque = bisque_means
+)
+
+```
+
+```{r}
+#scripts/21_compare_methods_plots.R
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(reshape2)
+})
+
+music  <- fread(file.path(DIR_RESULTS, "deconv", "music",  "music_proportions.csv"))
+epic   <- fread(file.path(DIR_RESULTS, "deconv", "epic",   "epic_proportions.csv"))
+bisque <- fread(file.path(DIR_RESULTS, "deconv", "bisque", "bisque_proportions.csv"))
+
+celltypes <- c("T_cells", "B_cells", "Myeloid", "Epithelial", "Stromal", "Endothelial", "Other")
+
+# Keep common columns and a sample column with the same name
+music_df <- as.data.frame(music[, c("sample", celltypes), with = FALSE])
+epic_df  <- as.data.frame(epic[,  c("sample", celltypes), with = FALSE])
+bisque_df <- as.data.frame(bisque[, c("sample", celltypes), with = FALSE])
+
+# Align sample order
+music_df  <- music_df[order(music_df$sample), ]
+epic_df   <- epic_df[order(epic_df$sample), ]
+bisque_df <- bisque_df[order(bisque_df$sample), ]
+
+stopifnot(identical(music_df$sample, epic_df$sample))
+stopifnot(identical(music_df$sample, bisque_df$sample))
+
+out_dir <- file.path(DIR_RESULTS, "deconv", "comparison")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------
+# 1) Boxplot by method and cell type
+# -----------------------------
+music_long <- melt(music_df, id.vars = "sample", variable.name = "celltype", value.name = "proportion")
+music_long$method <- "MuSiC"
+
+epic_long <- melt(epic_df, id.vars = "sample", variable.name = "celltype", value.name = "proportion")
+epic_long$method <- "EPIC"
+
+bisque_long <- melt(bisque_df, id.vars = "sample", variable.name = "celltype", value.name = "proportion")
+bisque_long$method <- "Bisque"
+
+plot_df <- rbind(music_long, epic_long, bisque_long)
+
+p_box <- ggplot(plot_df, aes(x = celltype, y = proportion, fill = method)) +
+  geom_boxplot(outlier.size = 0.5) +
+  theme_bw() +
+  labs(x = "Cell type", y = "Estimated proportion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  filename = file.path(out_dir, "method_comparison_boxplot.png"),
+  plot = p_box,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+# -----------------------------
+# 2) Mean proportions table
+# -----------------------------
+music_means  <- colMeans(music_df[, celltypes])
+epic_means   <- colMeans(epic_df[, celltypes])
+bisque_means <- colMeans(bisque_df[, celltypes])
+
+means_df <- data.table(
+  celltype = celltypes,
+  MuSiC = as.numeric(music_means[celltypes]),
+  EPIC = as.numeric(epic_means[celltypes]),
+  Bisque = as.numeric(bisque_means[celltypes])
+)
+
+fwrite(means_df, file.path(out_dir, "method_mean_proportions.csv"))
+
+# -----------------------------
+# 3) Heatmap of mean proportions
+# -----------------------------
+heat_df <- melt(means_df, id.vars = "celltype", variable.name = "method", value.name = "mean_prop")
+
+p_heat <- ggplot(heat_df, aes(x = method, y = celltype, fill = mean_prop)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.3f", mean_prop)), size = 3) +
+  theme_bw() +
+  labs(x = NULL, y = NULL, fill = "Mean proportion")
+
+ggsave(
+  filename = file.path(out_dir, "method_mean_heatmap.png"),
+  plot = p_heat,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+
+# -----------------------------
+# 4) Pairwise correlations between methods
+# -----------------------------
+pairwise_corr <- data.table(
+  celltype = celltypes,
+  MuSiC_vs_EPIC   = sapply(celltypes, function(ct) cor(music_df[[ct]], epic_df[[ct]])),
+  MuSiC_vs_Bisque = sapply(celltypes, function(ct) cor(music_df[[ct]], bisque_df[[ct]])),
+  EPIC_vs_Bisque  = sapply(celltypes, function(ct) cor(epic_df[[ct]], bisque_df[[ct]]))
+)
+
+fwrite(pairwise_corr, file.path(out_dir, "method_pairwise_correlations.csv"))
+
+# -----------------------------
+# 5) Scatter plots for key compartments
+# -----------------------------
+make_scatter <- function(x, y, xlab, ylab, title, file) {
+  df <- data.frame(x = x, y = y)
+  p <- ggplot(df, aes(x = x, y = y)) +
+    geom_point(alpha = 0.7) +
+    theme_bw() +
+    labs(x = xlab, y = ylab, title = title)
+  ggsave(file.path(out_dir, file), p, width = 5, height = 4, dpi = 300)
+}
+
+key_ct <- c("T_cells", "Myeloid", "Epithelial")
+
+for (ct in key_ct) {
+  make_scatter(
+    music_df[[ct]], epic_df[[ct]],
+    paste("MuSiC", ct), paste("EPIC", ct),
+    paste(ct, ": MuSiC vs EPIC"),
+    paste0("scatter_MuSiC_vs_EPIC_", ct, ".png")
+  )
+
+  make_scatter(
+    music_df[[ct]], bisque_df[[ct]],
+    paste("MuSiC", ct), paste("Bisque", ct),
+    paste(ct, ": MuSiC vs Bisque"),
+    paste0("scatter_MuSiC_vs_Bisque_", ct, ".png")
+  )
+
+  make_scatter(
+    epic_df[[ct]], bisque_df[[ct]],
+    paste("EPIC", ct), paste("Bisque", ct),
+    paste(ct, ": EPIC vs Bisque"),
+    paste0("scatter_EPIC_vs_Bisque_", ct, ".png")
+  )
+}
+
+log_msg("Saved:", file.path(out_dir, "method_comparison_boxplot.png"))
+log_msg("Saved:", file.path(out_dir, "method_mean_heatmap.png"))
+log_msg("Saved:", file.path(out_dir, "method_mean_proportions.csv"))
+log_msg("Saved:", file.path(out_dir, "method_pairwise_correlations.csv"))
+
+print(means_df)
+print(pairwise_corr)
+```
+
+```{r}
+# scripts/21_compare_methods_plots.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(reshape2)
+  library(pheatmap)
+  library(grid)
+})
+
+# -----------------------------
+# Load deconvolution outputs
+# -----------------------------
+music_path  <- file.path(DIR_RESULTS, "deconv", "music",  "music_proportions.csv")
+epic_path   <- file.path(DIR_RESULTS, "deconv", "epic",   "epic_proportions.csv")
+bisque_path <- file.path(DIR_RESULTS, "deconv", "bisque", "bisque_proportions.csv")
+
+stopifnot(file.exists(music_path))
+stopifnot(file.exists(epic_path))
+stopifnot(file.exists(bisque_path))
+
+music  <- data.table::fread(music_path)
+epic   <- data.table::fread(epic_path)
+bisque <- data.table::fread(bisque_path)
+
+# -----------------------------
+# Standardize formats
+# -----------------------------
+# MuSiC already: rows = samples, cols = cell types + sample
+stopifnot("sample" %in% colnames(music))
+
+# EPIC already: rows = samples, cols = cell types + sample
+stopifnot("sample" %in% colnames(epic))
+
+# Bisque should already be fixed, but if not, repair it
+if (!"sample" %in% colnames(bisque)) {
+  # try to repair orientation if cell types are rownames in first column
+  bisque_raw <- read.csv(bisque_path, row.names = 1, check.names = FALSE)
+  bisque_fix <- as.data.frame(t(as.matrix(bisque_raw)))
+  bisque_fix$sample <- rownames(bisque_fix)
+  bisque <- as.data.table(bisque_fix)
+}
+
+# -----------------------------
+# Common cell types
+# -----------------------------
+celltypes <- c("T_cells", "B_cells", "Myeloid", "Epithelial", "Stromal", "Endothelial", "Other")
+
+stopifnot(all(c("sample", celltypes) %in% colnames(music)))
+stopifnot(all(c("sample", celltypes) %in% colnames(epic)))
+stopifnot(all(c("sample", celltypes) %in% colnames(bisque)))
+
+music_df  <- as.data.frame(music[, c("sample", celltypes), with = FALSE])
+epic_df   <- as.data.frame(epic[,  c("sample", celltypes), with = FALSE])
+bisque_df <- as.data.frame(bisque[, c("sample", celltypes), with = FALSE])
+
+# align order by sample
+music_df  <- music_df[order(music_df$sample), ]
+epic_df   <- epic_df[order(epic_df$sample), ]
+bisque_df <- bisque_df[order(bisque_df$sample), ]
+
+stopifnot(identical(music_df$sample, epic_df$sample))
+stopifnot(identical(music_df$sample, bisque_df$sample))
+
+samples <- music_df$sample
+
+# -----------------------------
+# Output dir
+# -----------------------------
+out_dir <- file.path(DIR_RESULTS, "deconv", "comparison")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------
+# Save mean/median tables
+# -----------------------------
+means_df <- data.table(
+  celltype = celltypes,
+  MuSiC  = colMeans(music_df[,  celltypes, drop = FALSE]),
+  EPIC   = colMeans(epic_df[,   celltypes, drop = FALSE]),
+  Bisque = colMeans(bisque_df[, celltypes, drop = FALSE])
+)
+
+medians_df <- data.table(
+  celltype = celltypes,
+  MuSiC  = apply(music_df[,  celltypes, drop = FALSE], 2, median),
+  EPIC   = apply(epic_df[,   celltypes, drop = FALSE], 2, median),
+  Bisque = apply(bisque_df[, celltypes, drop = FALSE], 2, median)
+)
+
+data.table::fwrite(means_df,   file.path(out_dir, "method_mean_proportions.csv"))
+data.table::fwrite(medians_df, file.path(out_dir, "method_median_proportions.csv"))
+
+# -----------------------------
+# Pairwise correlations by cell type
+# -----------------------------
+pairwise_corr <- data.table(
+  celltype = celltypes,
+  MuSiC_vs_EPIC   = sapply(celltypes, function(ct) cor(music_df[[ct]],  epic_df[[ct]],   method = "spearman")),
+  MuSiC_vs_Bisque = sapply(celltypes, function(ct) cor(music_df[[ct]],  bisque_df[[ct]], method = "spearman")),
+  EPIC_vs_Bisque  = sapply(celltypes, function(ct) cor(epic_df[[ct]],   bisque_df[[ct]], method = "spearman"))
+)
+
+data.table::fwrite(pairwise_corr, file.path(out_dir, "method_pairwise_correlations.csv"))
+
+# -----------------------------
+# Long format for plotting
+# -----------------------------
+music_long <- melt(music_df, id.vars = "sample", variable.name = "celltype", value.name = "proportion")
+music_long$method <- "MuSiC"
+
+epic_long <- melt(epic_df, id.vars = "sample", variable.name = "celltype", value.name = "proportion")
+epic_long$method <- "EPIC"
+
+bisque_long <- melt(bisque_df, id.vars = "sample", variable.name = "celltype", value.name = "proportion")
+bisque_long$method <- "Bisque"
+
+plot_df <- rbind(music_long, epic_long, bisque_long)
+plot_df$celltype <- factor(plot_df$celltype, levels = celltypes)
+plot_df$method <- factor(plot_df$method, levels = c("MuSiC", "EPIC", "Bisque"))
+
+# -----------------------------
+# 1) Boxplot by method and cell type
+# -----------------------------
+p_box <- ggplot(plot_df, aes(x = celltype, y = proportion, fill = method)) +
+  geom_boxplot(outlier.size = 0.4) +
+  theme_bw() +
+  labs(x = "Cell type", y = "Estimated proportion") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  filename = file.path(out_dir, "boxplot_methods_by_celltype.png"),
+  plot = p_box,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+# -----------------------------
+# 2) Faceted boxplot, one panel per cell type
+# -----------------------------
+p_box_facet <- ggplot(plot_df, aes(x = method, y = proportion, fill = method)) +
+  geom_boxplot(outlier.size = 0.4) +
+  facet_wrap(~ celltype, scales = "free_y", ncol = 4) +
+  theme_bw() +
+  labs(x = NULL, y = "Estimated proportion") +
+  theme(legend.position = "none")
+
+ggsave(
+  filename = file.path(out_dir, "boxplot_faceted_by_celltype.png"),
+  plot = p_box_facet,
+  width = 11,
+  height = 7,
+  dpi = 300
+)
+
+# -----------------------------
+# 3) Stacked barplots per method
+# -----------------------------
+make_stacked_barplot <- function(df, method_name, file_name) {
+  long_df <- melt(df, id.vars = "sample", variable.name = "celltype", value.name = "proportion")
+  long_df$celltype <- factor(long_df$celltype, levels = celltypes)
+
+  p <- ggplot(long_df, aes(x = sample, y = proportion, fill = celltype)) +
+    geom_bar(stat = "identity", width = 1) +
+    theme_bw() +
+    labs(x = "Samples", y = "Estimated proportion", title = method_name) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      panel.grid = element_blank()
+    )
+
+  ggsave(
+    filename = file.path(out_dir, file_name),
+    plot = p,
+    width = 12,
+    height = 5,
+    dpi = 300
+  )
+}
+
+make_stacked_barplot(music_df,  "MuSiC",  "stackedbar_music.png")
+make_stacked_barplot(epic_df,   "EPIC",   "stackedbar_epic.png")
+make_stacked_barplot(bisque_df, "Bisque", "stackedbar_bisque.png")
+
+# -----------------------------
+# 4) Heatmap of mean proportions
+# -----------------------------
+mean_mat <- as.matrix(data.frame(
+  MuSiC  = means_df$MuSiC,
+  EPIC   = means_df$EPIC,
+  Bisque = means_df$Bisque,
+  row.names = means_df$celltype
+))
+
+png(file.path(out_dir, "heatmap_mean_proportions.png"), width = 1600, height = 1200, res = 200)
+pheatmap(
+  mean_mat,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.3f",
+  fontsize = 11,
+  main = "Mean estimated proportions by method"
+)
+dev.off()
+
+# -----------------------------
+# 5) Heatmap of pairwise correlations
+# -----------------------------
+corr_mat <- as.matrix(data.frame(
+  MuSiC_vs_EPIC   = pairwise_corr$MuSiC_vs_EPIC,
+  MuSiC_vs_Bisque = pairwise_corr$MuSiC_vs_Bisque,
+  EPIC_vs_Bisque  = pairwise_corr$EPIC_vs_Bisque,
+  row.names = pairwise_corr$celltype
+))
+
+png(file.path(out_dir, "heatmap_pairwise_correlations.png"), width = 1600, height = 1200, res = 200)
+pheatmap(
+  corr_mat,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  fontsize = 11,
+  main = "Spearman correlation between methods"
+)
+dev.off()
+
+# -----------------------------
+# 6) Scatter plots for key compartments
+# -----------------------------
+make_scatter <- function(x, y, xlab, ylab, title, file_name) {
+  df <- data.frame(x = x, y = y)
+  p <- ggplot(df, aes(x = x, y = y)) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(method = "lm", se = FALSE) +
+    theme_bw() +
+    labs(x = xlab, y = ylab, title = title)
+
+  ggsave(
+    filename = file.path(out_dir, file_name),
+    plot = p,
+    width = 5,
+    height = 4,
+    dpi = 300
+  )
+}
+
+key_ct <- c("T_cells", "Myeloid", "Epithelial", "Stromal")
+
+for (ct in key_ct) {
+  make_scatter(
+    music_df[[ct]], epic_df[[ct]],
+    paste("MuSiC", ct), paste("EPIC", ct),
+    paste(ct, ": MuSiC vs EPIC"),
+    paste0("scatter_music_vs_epic_", ct, ".png")
+  )
+
+  make_scatter(
+    music_df[[ct]], bisque_df[[ct]],
+    paste("MuSiC", ct), paste("Bisque", ct),
+    paste(ct, ": MuSiC vs Bisque"),
+    paste0("scatter_music_vs_bisque_", ct, ".png")
+  )
+
+  make_scatter(
+    epic_df[[ct]], bisque_df[[ct]],
+    paste("EPIC", ct), paste("Bisque", ct),
+    paste(ct, ": EPIC vs Bisque"),
+    paste0("scatter_epic_vs_bisque_", ct, ".png")
+  )
+}
+
+# -----------------------------
+# 7) PCA on compositions per method
+# -----------------------------
+make_pca_plot <- function(df, method_name, file_name) {
+  mat <- as.matrix(df[, celltypes, drop = FALSE])
+  pca <- prcomp(mat, center = TRUE, scale. = TRUE)
+
+  pca_df <- data.frame(
+    PC1 = pca$x[, 1],
+    PC2 = pca$x[, 2],
+    sample = df$sample
+  )
+
+  p <- ggplot(pca_df, aes(x = PC1, y = PC2)) +
+    geom_point(alpha = 0.8) +
+    theme_bw() +
+    labs(title = paste("PCA of estimated compositions -", method_name))
+
+  ggsave(
+    filename = file.path(out_dir, file_name),
+    plot = p,
+    width = 5,
+    height = 4,
+    dpi = 300
+  )
+}
+
+make_pca_plot(music_df,  "MuSiC",  "pca_music.png")
+make_pca_plot(epic_df,   "EPIC",   "pca_epic.png")
+make_pca_plot(bisque_df, "Bisque", "pca_bisque.png")
+
+# -----------------------------
+# 8) Rank correlation of samples by epithelial fraction
+# -----------------------------
+rank_df <- data.table(
+  sample = samples,
+  MuSiC_Epithelial  = rank(-music_df$Epithelial, ties.method = "average"),
+  EPIC_Epithelial   = rank(-epic_df$Epithelial, ties.method = "average"),
+  Bisque_Epithelial = rank(-bisque_df$Epithelial, ties.method = "average")
+)
+
+data.table::fwrite(rank_df, file.path(out_dir, "epithelial_ranks_by_method.csv"))
+
+# -----------------------------
+# 9) Save standardized tables
+# -----------------------------
+data.table::fwrite(as.data.table(music_df),  file.path(out_dir, "music_standardized.csv"))
+data.table::fwrite(as.data.table(epic_df),   file.path(out_dir, "epic_standardized.csv"))
+data.table::fwrite(as.data.table(bisque_df), file.path(out_dir, "bisque_standardized.csv"))
+
+# -----------------------------
+# 10) Console output
+# -----------------------------
+log_msg("Saved:", file.path(out_dir, "boxplot_methods_by_celltype.png"))
+log_msg("Saved:", file.path(out_dir, "boxplot_faceted_by_celltype.png"))
+log_msg("Saved:", file.path(out_dir, "stackedbar_music.png"))
+log_msg("Saved:", file.path(out_dir, "stackedbar_epic.png"))
+log_msg("Saved:", file.path(out_dir, "stackedbar_bisque.png"))
+log_msg("Saved:", file.path(out_dir, "heatmap_mean_proportions.png"))
+log_msg("Saved:", file.path(out_dir, "heatmap_pairwise_correlations.png"))
+log_msg("Saved:", file.path(out_dir, "method_mean_proportions.csv"))
+log_msg("Saved:", file.path(out_dir, "method_pairwise_correlations.csv"))
+
+print(means_df)
+print(pairwise_corr)
+
+```
+
+```{r}
+# scripts/22_build_cibersort_signature.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(data.table)
+})
+
+set.seed(1)
+
+in_rds <- file.path(DIR_RESULTS, "scrna", "scrna_seurat_compartments_singleR.rds")
+stopifnot(file.exists(in_rds))
+
+seu <- readRDS(in_rds)
+
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+
+meta <- seu@meta.data
+stopifnot("cellcompartment" %in% colnames(meta))
+
+counts <- GetAssayData(seu, layer = "counts")
+logdata <- GetAssayData(seu, layer = "data")
+
+celltypes <- levels(meta$cellcompartment)
+cells_by_type <- split(colnames(seu), meta$cellcompartment)
+
+log_msg("Cell types:", paste(celltypes, collapse = " | "))
+
+# -----------------------------
+# Build full signature by mean counts
+# -----------------------------
+sig_full <- sapply(celltypes, function(ct) {
+  cells <- cells_by_type[[ct]]
+  Matrix::rowMeans(counts[, cells, drop = FALSE])
+})
+
+sig_full <- as.matrix(sig_full)
+
+# -----------------------------
+# Select informative genes
+# top markers per compartment based on log-expression difference
+# -----------------------------
+marker_list <- lapply(celltypes, function(ct) {
+  cells_in  <- cells_by_type[[ct]]
+  cells_out <- setdiff(colnames(seu), cells_in)
+
+  m_in  <- Matrix::rowMeans(logdata[, cells_in, drop = FALSE])
+  m_out <- Matrix::rowMeans(logdata[, cells_out, drop = FALSE])
+
+  score <- m_in - m_out
+  names(score) <- rownames(logdata)
+
+  names(sort(score, decreasing = TRUE))[1:150]
+})
+
+marker_genes <- unique(unlist(marker_list))
+marker_genes <- intersect(marker_genes, rownames(sig_full))
+
+sig <- sig_full[marker_genes, , drop = FALSE]
+
+# remove zero-variance genes across compartments
+keep <- apply(sig, 1, function(x) sd(x) > 0)
+sig <- sig[keep, , drop = FALSE]
+
+log_msg("Reduced signature dims:", nrow(sig), "genes x", ncol(sig), "celltypes")
+
+out_dir <- file.path(DIR_RESULTS, "deconv", "cibersort")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+sig_file <- file.path(out_dir, "cibersort_signature_matrix.txt")
+
+data.table::fwrite(
+  data.table(Gene = rownames(sig), sig),
+  sig_file,
+  sep = "\t"
+)
+
+log_msg("Saved:", sig_file)
+```
+
+```{r}
+# scripts/23_run_cibersort.R
+
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(CIBERSORT)
+})
+
+set.seed(1)
+
+sig_file  <- file.path(DIR_RESULTS, "deconv", "cibersort", "cibersort_signature_matrix.txt")
+bulk_file <- file.path(DIR_RESULTS, "aligned", "bulk_tpm_common_genes.rds")
+
+stopifnot(file.exists(sig_file))
+stopifnot(file.exists(bulk_file))
+
+bulk <- readRDS(bulk_file)
+bulk <- as.matrix(bulk)
+
+# align bulk genes to signature genes
+sig_dt <- fread(sig_file, sep = "\t")
+sig_genes <- sig_dt$Gene
+
+common <- intersect(rownames(bulk), sig_genes)
+stopifnot(length(common) > 0)
+
+bulk2 <- bulk[common, , drop = FALSE]
+
+mix_file <- file.path(DIR_RESULTS, "deconv", "cibersort", "bulk_mixture.txt")
+
+fwrite(
+  data.table(Gene = rownames(bulk2), bulk2),
+  mix_file,
+  sep = "\t"
+)
+
+log_msg("Running CIBERSORT")
+log_msg("Mixture dims:", nrow(bulk2), "genes x", ncol(bulk2), "samples")
+
+res <- cibersort(
+  sig_file,
+  mix_file,
+  perm = 0,
+  QN = TRUE
+)
+
+res <- as.data.table(res)
+res$sample <- rownames(res)
+setcolorder(res, c("sample", setdiff(colnames(res), "sample")))
+
+out_dir <- file.path(DIR_RESULTS, "deconv", "cibersort")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_file <- file.path(out_dir, "cibersort_proportions.csv")
+fwrite(res, out_file)
+
+log_msg("Saved:", out_file)
+log_msg("Output dims:", nrow(res), "samples x", ncol(res), "columns")
+```
+
+
+```{r}
+cibersort <- data.table::fread("results/deconv/cibersort/cibersort_proportions.csv")
+
+colnames(cibersort)
+
+summary(cibersort)
+
+```
+
+```{r}
+source("scripts/00_setup_paths.R")
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(reshape2)
+  library(pheatmap)
+})
+
+# -----------------------------
+# Load results
+# -----------------------------
+
+music  <- fread(file.path(DIR_RESULTS,"deconv","music","music_proportions.csv"))
+epic   <- fread(file.path(DIR_RESULTS,"deconv","epic","epic_proportions.csv"))
+bisque <- fread(file.path(DIR_RESULTS,"deconv","bisque","bisque_proportions.csv"))
+ciber  <- fread(file.path(DIR_RESULTS,"deconv","cibersort","cibersort_proportions.csv"))
+
+# -----------------------------
+# Remove CIBERSORT metrics
+# -----------------------------
+
+drop_cols <- c("P.value","Correlation","RMSE")
+
+ciber <- ciber[, !colnames(ciber) %in% drop_cols, with=FALSE]
+
+# -----------------------------
+# Cell types
+# -----------------------------
+
+celltypes <- c(
+"T_cells",
+"B_cells",
+"Myeloid",
+"Epithelial",
+"Stromal",
+"Endothelial",
+"Other"
+)
+
+# -----------------------------
+# Means per method
+# -----------------------------
+
+music_mean  <- colMeans(music[, ..celltypes])
+epic_mean   <- colMeans(epic[, ..celltypes])
+bisque_mean <- colMeans(bisque[, ..celltypes])
+ciber_mean  <- colMeans(ciber[, ..celltypes])
+
+means <- data.table(
+celltype = celltypes,
+MuSiC = music_mean,
+EPIC = epic_mean,
+Bisque = bisque_mean,
+CIBERSORT = ciber_mean
+)
+
+print(means)
+
+# -----------------------------
+# Heatmap of mean composition
+# -----------------------------
+
+mat <- as.matrix(means[, -1])
+rownames(mat) <- means$celltype
+
+pheatmap(
+mat,
+cluster_rows = FALSE,
+cluster_cols = FALSE,
+display_numbers = TRUE,
+main = "Mean cell type proportions"
+)
+
+# -----------------------------
+# Prepare long format
+# -----------------------------
+
+music$method <- "MuSiC"
+epic$method <- "EPIC"
+bisque$method <- "Bisque"
+ciber$method <- "CIBERSORT"
+
+all <- rbind(
+music[, c("sample",celltypes,"method"), with=FALSE],
+epic[, c("sample",celltypes,"method"), with=FALSE],
+bisque[, c("sample",celltypes,"method"), with=FALSE],
+ciber[, c("sample",celltypes,"method"), with=FALSE]
+)
+
+long <- melt(
+all,
+id.vars = c("sample","method"),
+variable.name = "celltype",
+value.name = "proportion"
+)
+
+# -----------------------------
+# Boxplot comparison
+# -----------------------------
+
+ggplot(long, aes(celltype, proportion, fill=method)) +
+geom_boxplot(outlier.size=0.3) +
+theme_bw() +
+theme(axis.text.x = element_text(angle=45,hjust=1)) +
+labs(
+title="Deconvolution comparison",
+x="Cell type",
+y="Estimated proportion"
+)
+
+# -----------------------------
+# Method correlations
+# -----------------------------
+
+cor_music_epic <- cor(
+music[, ..celltypes],
+epic[, ..celltypes]
+)
+
+cor_music_bisque <- cor(
+music[, ..celltypes],
+bisque[, ..celltypes]
+)
+
+cor_music_ciber <- cor(
+music[, ..celltypes],
+ciber[, ..celltypes]
+)
+
+log_msg("Mean proportions:")
+print(means)
+
+log_msg("Correlation MuSiC vs EPIC:")
+print(diag(cor_music_epic))
+
+log_msg("Correlation MuSiC vs Bisque:")
+print(diag(cor_music_bisque))
+
+log_msg("Correlation MuSiC vs CIBERSORT:")
+print(diag(cor_music_ciber))
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
